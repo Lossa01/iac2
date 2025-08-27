@@ -1,0 +1,183 @@
+import numpy as np
+import time
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.model_selection import train_test_split
+import os
+from google.colab import files
+
+# ==========================
+# Subir el archivo CSV
+# ==========================
+print("Selecciona el archivo ejemploA_datos_carga.csv desde tu PC")
+uploaded = files.upload()
+
+# Cargar el CSV
+filename = "ejemploA_datos_carga.csv"
+df_data = pd.read_csv(filename)
+
+# ==========================
+# Parámetros de la variante V10
+# ==========================
+etas = [1e-3, 2e-3, 3e-3, 5e-3]  # tasas de aprendizaje
+max_epochs = 160
+patience = 8
+min_delta = 5e-5
+split_val = 0.33  # 67/33/0 (train/valid, sin test)
+estandarizar = False  # En V10 no se estandariza
+
+# ==========================
+# Carpetas de salida
+# ==========================
+os.makedirs("figs", exist_ok=True)
+os.makedirs("code", exist_ok=True)
+
+# ==========================
+# Preparar datos
+# ==========================
+X = df_data[["m2"]].values
+y = df_data["UF"].values
+
+# Split 67% train, 33% valid
+X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=split_val, random_state=42)
+
+# Agregar columna de unos (bias)
+X_train = np.c_[np.ones(X_train.shape[0]), X_train]
+X_val = np.c_[np.ones(X_val.shape[0]), X_val]
+
+n_train, d = X_train.shape
+
+# ==========================
+# Función FLOPs
+# ==========================
+def flops_epoch(n, d):
+    return 4*n*d + n + 3*d
+
+# ==========================
+# Entrenamiento con early stopping
+# ==========================
+results = []
+
+for eta in etas:
+    w = np.zeros(d)
+    best_val_rmse = np.inf
+    best_w = None
+    patience_counter = 0
+    history_rmse_val = []
+    history_rmse_train = []
+
+    start_time = time.time()
+    epoch = 0
+
+    while epoch < max_epochs:
+        # Forward + Gradiente
+        y_pred_train = X_train @ w
+        error = y_pred_train - y_train
+        grad = (X_train.T @ error) / n_train
+        w -= eta * grad
+
+        # RMSE de entrenamiento
+        rmse_train = np.sqrt(mean_squared_error(y_train, y_pred_train))
+        history_rmse_train.append(rmse_train)
+
+        # Validación
+        y_pred_val = X_val @ w
+        rmse_val = np.sqrt(mean_squared_error(y_val, y_pred_val))
+        history_rmse_val.append(rmse_val)
+
+        # Early stopping
+        if rmse_val < best_val_rmse - min_delta:
+            best_val_rmse = rmse_val
+            best_w = w.copy()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                break
+
+        epoch += 1
+
+    end_time = time.time()
+
+    # Restaurar mejor modelo
+    w = best_w
+    y_pred_val = X_val @ w
+
+    # Métricas finales
+    RMSE_val = np.sqrt(mean_squared_error(y_val, y_pred_val))
+    MAE_val = mean_absolute_error(y_val, y_pred_val)
+    R2_val = r2_score(y_val, y_pred_val)
+
+    wall_time_s = end_time - start_time
+    ms_per_epoch = (wall_time_s / epoch) * 1000 if epoch > 0 else 0
+
+    FLOPs_per_epoch = flops_epoch(n_train, d)
+    FLOPs_total = FLOPs_per_epoch * epoch
+
+    results.append([eta, epoch, RMSE_val, MAE_val, R2_val, wall_time_s,
+                    ms_per_epoch, FLOPs_per_epoch, FLOPs_total])
+
+    # ==========================
+    # Gráficas
+    # ==========================
+
+    # Curva de pérdida (Validación)
+    plt.figure()
+    plt.plot(range(1, len(history_rmse_val)+1), history_rmse_val, label=f"η={eta}")
+    plt.axvline(epoch, color="red", linestyle="--", label="Parada")
+    plt.xlabel("Época")
+    plt.ylabel("RMSE Validación")
+    plt.title(f"Curva de pérdida - η={eta}")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(f"figs/curva_perdida_val_eta_{eta}.png", dpi=150)
+    plt.close()
+
+    # Curva de pérdida (Entrenamiento vs Validación)
+    plt.figure()
+    plt.plot(range(1, len(history_rmse_train)+1), history_rmse_train, label="Entrenamiento")
+    plt.plot(range(1, len(history_rmse_val)+1), history_rmse_val, label="Validación")
+    plt.axvline(epoch, color="red", linestyle="--", label="Parada Temprana")
+    plt.xlabel("Época")
+    plt.ylabel("RMSE")
+    plt.title(f"Curva de Pérdida (Entrenamiento vs Validación) - η={eta}")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(f"figs/curva_perdida_train_val_eta_{eta}.png", dpi=150)
+    plt.close()
+
+# ==========================
+# Tabla de resultados
+# ==========================
+df_results = pd.DataFrame(results, columns=[
+    "eta", "epoca_parada", "RMSE_val", "MAE_val", "R2_val",
+    "wall_time_s", "ms/epoca", "FLOPs/epoca", "FLOPs_total"
+])
+
+print("Resultados comparativos:\n")
+print(df_results)
+
+# Guardar tabla en CSV
+df_results.to_csv("resultados_V10.csv", index=False)
+
+print("\n Resultados guardados en resultados_V10.csv y figuras en carpeta figs/")
+
+# ==========================
+# Análisis de Pareto
+# ==========================
+plt.figure(figsize=(10, 6))
+plt.scatter(df_results["wall_time_s"], df_results["RMSE_val"], c=df_results["eta"], cmap='viridis', s=100)
+plt.xlabel("Tiempo de Ejecución (s)")
+plt.ylabel("RMSE Validación")
+plt.title("Análisis de Pareto: Rendimiento vs. Tiempo por Tasa de Aprendizaje (η)")
+plt.colorbar(label="Tasa de Aprendizaje (η)")
+
+# Etiquetas
+for i, row in df_results.iterrows():
+    plt.annotate(f"η={row['eta']}", (row['wall_time_s'], row['RMSE_val']), 
+                 textcoords="offset points", xytext=(0,10), ha='center')
+
+plt.grid(True)
+plt.savefig("figs/pareto_rendimiento_tiempo.png", dpi=150)
+plt.show()
